@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from vllm.config import get_current_vllm_config
+from vllm.logger import logger
 from vllm.model_executor.models.qwen3_dflash import (
     DFlashQwen3ForCausalLM,
     DFlashQwen3Model,
@@ -50,7 +51,17 @@ def precompute_and_store_context_kv(
     all_v = all_kv[1]  # [L, num_ctx, nkv, hd], contiguous
 
     # --- Per-layer RMSNorm K (3D: [num_ctx, nkv, hd] per layer) ---
-    if self._use_q_only_context_rope and all_k.numel() * all_k.element_size() <= _MAX_STACKED_CONTEXT_NORM_BYTES:
+    stacked_norm = (
+        self._use_q_only_context_rope
+        and all_k.numel() * all_k.element_size() <= _MAX_STACKED_CONTEXT_NORM_BYTES
+    )
+    logger.info(
+        "[ascend-dflash][context] use_q_only_rope=%s stacked_norm=%s num_ctx=%s",
+        self._use_q_only_context_rope,
+        stacked_norm,
+        num_ctx,
+    )
+    if stacked_norm:
         # Retain native norm arithmetic while replacing six small output copies
         # with one stack. Large prefills retain bounded temporary storage.
         all_k_normed = torch.stack([self.layers[i].self_attn.k_norm(all_k[i]) for i in range(L)])

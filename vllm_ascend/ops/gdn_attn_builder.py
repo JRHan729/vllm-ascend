@@ -19,6 +19,7 @@ from dataclasses import dataclass, replace
 import torch
 from vllm.config import VllmConfig
 from vllm.distributed import get_pcp_group
+from vllm.logger import logger
 from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionBackend,
@@ -809,8 +810,10 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                     )
                 )
             ):
+                logger.info("[ascend-reuse][cached_decode] materialize cached GDN decode layout")
                 self._materialize_cached_spec_decode(metadata, common_attn_metadata.num_reqs)
             else:
+                logger.info("[ascend-reuse][cached_decode] fallback to pad_spec_decode_metadata")
                 self._pad_spec_decode_metadata(metadata, common_attn_metadata.num_reqs)
                 self._attach_spec_decode_metadata(metadata)
             return metadata
@@ -1160,6 +1163,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         GDN does not consume slot_mapping.
         """
         assert self.supports_update_block_table
+        logger.info("[ascend-reuse][gdn][update_block_table] graph_state_updates=%s", graph_state_updates is not None)
         m = metadata
         if (
             graph_state_updates is not None
