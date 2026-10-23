@@ -5,6 +5,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import get_forward_context, set_forward_context
+from vllm.logger import logger
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import (  # type: ignore[import-not-found]
@@ -87,6 +88,12 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""
+        logger.info(
+            "[ascend-dflash][GRAPH-REPLAY] cg_mode=%s num_reqs=%s num_tokens=%s",
+            desc.cg_mode,
+            desc.num_reqs,
+            desc.num_tokens,
+        )
         num_tokens = desc.num_tokens
         attn_backend = list(self.speculator.attn_backends.values())[0]
         draft_attn_metadatas = self.speculator.build_draft_attn_metadatas(
