@@ -144,7 +144,7 @@ def test_dense_query_boundaries_reuse_current_device_view(monkeypatch, reuse_dev
     builder.device = torch.device("cpu")
     builder.kv_cache_spec = None
     builder.speculative_config = None
-    builder.vllm_config = SimpleNamespace()
+    builder.vllm_config = SimpleNamespace(use_v2_model_runner=reuse_device)
     builder.model_config = SimpleNamespace(runner_type="generate")
     builder.attn_mask_builder = SimpleNamespace(get_attention_mask=lambda *args: None)
     builder._split_decodes_and_prefills = lambda common: (3, 0, boundaries[-1], 0)
@@ -162,6 +162,8 @@ def test_dense_query_boundaries_reuse_current_device_view(monkeypatch, reuse_dev
         causal=True,
         max_query_len=8,
         seq_lens=lengths,
+        is_prefilling=None,
+        num_input_tokens=boundaries[-1],
     )
     pinned = []
 
