@@ -554,7 +554,6 @@ def build_attn_metadata(
                     # GDN consumes only its physical state table here. Reusing
                     # the batch view avoids constructing common metadata and a
                     # slot-mapping view for every recurrent cache group.
-                    logger.info("[ascend-reuse][gdn][hit] key=%s", key)
                     update_kwargs = {}
                     if key in gdn_graph_updates:
                         update_kwargs["graph_state_updates"] = gdn_graph_updates[key][1]
@@ -695,7 +694,6 @@ def build_attn_metadata(
                     else None
                 )
                 if gdn_cache_key is not None and gdn_cache_key in cached_gdn_metadata:
-                    logger.info("[ascend-reuse][gdn][hit] variant key=%s", gdn_cache_key)
                     update_kwargs = {}
                     if gdn_cache_key in gdn_graph_updates:
                         update_kwargs["graph_state_updates"] = gdn_graph_updates[gdn_cache_key][1]
@@ -711,12 +709,10 @@ def build_attn_metadata(
                         **attn_metadata_extra_kwargs,
                     )
                     if gdn_cache_key is not None:
-                        logger.info("[ascend-reuse][gdn][miss] capture, building key=%s", gdn_cache_key)
                         cached_gdn_metadata[gdn_cache_key] = metadata
                         if hasattr(attn_metadata_builder, "graph_state_updater"):
                             gdn_graph_updates[gdn_cache_key] = (attn_metadata_builder.graph_state_updater, [])
                 elif dense_cache_key is not None and dense_cache_key in cached_dense_metadata:
-                    logger.info("[ascend-reuse][dense][hit] key=%s", dense_cache_key)
                     metadata = attn_metadata_builder.update_block_table(
                         cached_dense_metadata[dense_cache_key],
                         variant_common.block_table_tensor,
@@ -735,7 +731,6 @@ def build_attn_metadata(
                         **attn_metadata_extra_kwargs,
                     )
                     if dense_cache_key is not None:
-                        logger.info("[ascend-reuse][dense][miss] building key=%s", dense_cache_key)
                         cached_dense_metadata[dense_cache_key] = metadata
                     if gdn_cache_key is not None:
                         cached_gdn_metadata[gdn_cache_key] = metadata
