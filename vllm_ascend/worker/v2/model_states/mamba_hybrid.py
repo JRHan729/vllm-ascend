@@ -410,9 +410,18 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             num_draft_tokens_per_req = input_batch.num_draft_tokens_per_req
             if num_draft_tokens_per_req is None:
                 num_draft_tokens_per_req = np.zeros(input_batch.num_reqs, dtype=np.int32)
-            # Match upstream: request state selects decode, including zero drafts.
-            # Scheduled query lengths may differ from draft_count + 1.
-            is_decode = ~is_prefilling_np & (input_batch.num_scheduled_tokens > 0)
+            # Match upstream: request state selects decode, including zero
+            # drafts, and a row is a decode row only when it schedules at most
+            # one verify step (num_speculative_tokens + 1). Bounding the upper
+            # side keeps chunked-prefill tails and adaptive verification rows
+            # that schedule more tokens on the non-spec path instead of
+            # mislabeling them as draft rows.
+            spec_tokens = getattr(self.vllm_config, "num_speculative_tokens", 0)
+            is_decode = (
+                ~is_prefilling_np
+                & (input_batch.num_scheduled_tokens > 0)
+                & (input_batch.num_scheduled_tokens <= spec_tokens + 1)
+            )
             num_decode_draft_tokens_np[: input_batch.num_reqs] = np.where(is_decode, num_draft_tokens_per_req, -1)
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
 
