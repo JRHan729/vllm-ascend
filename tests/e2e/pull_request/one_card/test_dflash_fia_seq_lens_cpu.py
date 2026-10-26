@@ -89,6 +89,7 @@ def test_dflash_builder_chain_shares_and_refreshes_exact_npu_lengths(mode, monke
     spec._use_cpu_seq_lens = True
     spec._prepared_draft_attn_metadata = None
     spec.num_query_per_req = 8
+    spec.dcp_size = 1
     spec.max_model_len = spec.draft_max_seq_len = 256
     spec.input_batch = SimpleNamespace(num_reqs=2)
     spec.input_buffers = SimpleNamespace(

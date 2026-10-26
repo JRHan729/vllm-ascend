@@ -199,7 +199,11 @@ def test_gdn_shared_metadata_aclgraph_reads_updated_group_states():
     config = SimpleNamespace(
         use_v2_model_runner=True,
         additional_config=None,
-        model_config=SimpleNamespace(max_model_len=1024),
+        model_config=SimpleNamespace(
+            max_model_len=1024,
+            hf_text_config=SimpleNamespace(model_type="qwen3_5", linear_attn_config={"num_heads": 8}),
+            get_num_attention_heads=lambda _parallel_config: 8,
+        ),
         cache_config=SimpleNamespace(mamba_cache_mode="none"),
         compilation_config=SimpleNamespace(
             cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY, max_cudagraph_capture_size=None
