@@ -1624,7 +1624,10 @@ def test_input_staging_is_bypassed_for_partitioned_execution(partition):
     if partition == "pp":
         runner.use_pp = True
     elif partition == "pcp":
-        runner.pcp_manager = SimpleNamespace(get_global_graph_num_reqs=lambda _: None)
+        runner.pcp_manager = SimpleNamespace(
+            get_global_graph_num_reqs=lambda _: None,
+            partition_batch=lambda input_batch, batch_desc: input_batch,
+        )
     else:
         desc.num_ubatches = 2
     _run_prepare_inputs(runner, output, batch, desc)

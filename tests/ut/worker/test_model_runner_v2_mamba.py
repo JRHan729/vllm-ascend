@@ -444,6 +444,7 @@ def test_prepare_attn_classifies_one_token_prompt_tails(mock_build_attn_metadata
         vllm_config=SimpleNamespace(num_speculative_tokens=3, parallel_config=SimpleNamespace()),
         num_accepted_tokens_gpu=torch.tensor([1, 2, 3], dtype=torch.int32),
         max_model_len=1024,
+        _align_mode=False,
     )
     input_batch = SimpleNamespace(
         num_reqs=3,
