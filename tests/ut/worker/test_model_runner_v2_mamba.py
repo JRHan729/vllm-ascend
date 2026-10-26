@@ -477,8 +477,10 @@ def test_prepare_attn_classifies_one_token_prompt_tails(mock_build_attn_metadata
     )
     metadata = mock_build_attn_metadata.call_args.kwargs["model_specific_attn_metadata"]
     assert metadata.is_prefilling.tolist() == [False, True, False]
-    expected_drafts = num_draft_tokens if num_draft_tokens else -1
-    assert metadata.num_decode_draft_tokens_cpu.tolist() == [expected_drafts, -1, expected_drafts]
+    # vLLM upstream/MRV2 selects decode from request state, so a zero-draft
+    # decode row is a spec-decode row with zero drafts (0), not a plain decode
+    # row (-1). Only the prefill row stays -1.
+    assert metadata.num_decode_draft_tokens_cpu.tolist() == [num_draft_tokens, -1, num_draft_tokens]
     np.testing.assert_array_equal(input_batch.is_prefilling_np, [True, True, False])
 
 
