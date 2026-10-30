@@ -130,7 +130,6 @@ estimated_times:
   tests/e2e/pull_request/two_card/_310p/test_vl_model_310p.py: 330
   tests/e2e/pull_request/four_card/_310p/test_dense_model_310p.py: 250
   tests/e2e/pull_request/four_card/_310p/test_moe_model_310p.py: 290
-  tests/e2e/pull_request/four_card/context_parallel/test_accuracy.py: 1360
   tests/e2e/pull_request/four_card/context_parallel/test_accuracy_v2.py: 1060
   tests/e2e/pull_request/four_card/context_parallel/test_deepseek_v4.py: 1230
   tests/e2e/pull_request/four_card/context_parallel/test_prefix_caching_cp.py: 210
@@ -174,3 +173,6 @@ estimated_times:
   # Conservative scheduling estimate; refine after the first A5 run.
   tests/e2e/pull_request/one_card/test_mla_fp8_decode_layout_a5.py: 180
   tests/e2e/pull_request/one_card/test_glm5next_pooled_cache_write.py: 30
+  # Bootstrap estimate; refine after the first NPU run.
+  tests/e2e/pull_request/one_card/test_cached_gdn_decode.py: 600
+  tests/e2e/pull_request/one_card/test_gdn_metadata_reuse_v2.py: 600
