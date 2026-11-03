@@ -22,7 +22,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import VllmConfig, get_current_vllm_config, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.logger import logger
@@ -275,30 +275,23 @@ class ModelWithContext(nn.Module):
             if self.device_metadata is not None:
                 self.device_metadata.finish()
 
+    def precompute_and_store_context_kv(self, *args, **kwargs):
+        # The context prefix runs before the query's forward scope. Publish
+        # the same capture/draft state for its native Ascend operators.
+        context_states = args[0] if args else kwargs["context_states"]
+        with set_forward_context(
+            None,
+            get_current_vllm_config(),
+            num_tokens=context_states.shape[0],
+            cudagraph_runtime_mode=CUDAGraphMode.FULL,
+        ):
+            _EXTRA_CTX.capturing = torch.npu.is_current_stream_capturing()
+            _EXTRA_CTX.is_draft_model = self.is_draft_model
+            _EXTRA_CTX.is_draft_model_prefill = self.is_draft_model_prefill
+            return self.original_model.precompute_and_store_context_kv(*args, **kwargs)
+
     def get_original_model(self):
         return self.original_model
-
-    def compute_logits(self, hidden_states: torch.Tensor):
-        # draft model has `compute_logits`, which is not in ModelWithContext
-        return self.original_model.compute_logits(hidden_states)
-
-    def compute_draft_logits(self, hidden_states: torch.Tensor):
-        return self.original_model.compute_draft_logits(hidden_states)
-
-    def markov_embed(self, token_ids: torch.Tensor):
-        return self.original_model.markov_embed(token_ids)
-
-    def markov_bias(self, markov_embed: torch.Tensor):
-        return self.original_model.markov_bias(markov_embed)
-
-    def map_draft_to_target(self, draft_ids: torch.Tensor):
-        return self.original_model.map_draft_to_target(draft_ids)
-
-    def embed_input_ids(self, *args, **kwargs):
-        return self.original_model.embed_input_ids(*args, **kwargs)
-
-    def compute_confidence(self, head_hidden: torch.Tensor, markov_embed: torch.Tensor):
-        return self.original_model.compute_confidence(head_hidden, markov_embed)
 
     def __getattr__(self, name: str):
         # vLLM #57632 moved the draft context-K/V precompute into the

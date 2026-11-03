@@ -11,6 +11,7 @@
 estimated_times:
   tests/e2e/pull_request/one_card/test_kv_pool_accuracy.py: 410
   tests/e2e/pull_request/one_card/test_flash_attn_precision.py: 30
+  tests/e2e/pull_request/one_card/test_swiglu_mx_quant.py: 30
   tests/e2e/pull_request/four_card/model_runner_v2/test_kvpp_pp.py: 300
   tests/e2e/pull_request/four_card/test_kvpp_pd.py: 230
   tests/e2e/pull_request/two_card/test_kvpp.py: 290
@@ -101,6 +102,8 @@ estimated_times:
   tests/e2e/pull_request/two_card/model_runner_v2/test_qwen3_6_dflash.py: 600
   tests/e2e/pull_request/two_card/model_runner_v2/test_qwen3_6_dspark.py: 600
   tests/e2e/pull_request/two_card/model_runner_v2/test_qwen3_6_mtp.py: 710
+  # Initial estimate: one target-only and three LiLiCorr model runs.
+  tests/e2e/pull_request/two_card/model_runner_v2/test_qwen3_8_lilicorr.py: 1200
   tests/e2e/pull_request/two_card/model_runner_v2/test_spec_decode_data_parallel.py: 460
   tests/e2e/pull_request/two_card/spec_decode/test_spec_decode.py: 850
   tests/e2e/pull_request/two_card/spec_decode/test_spec_decode_heavy.py: 1020
@@ -130,7 +133,6 @@ estimated_times:
   tests/e2e/pull_request/two_card/_310p/test_vl_model_310p.py: 330
   tests/e2e/pull_request/four_card/_310p/test_dense_model_310p.py: 250
   tests/e2e/pull_request/four_card/_310p/test_moe_model_310p.py: 290
-  tests/e2e/pull_request/four_card/context_parallel/test_accuracy.py: 1360
   tests/e2e/pull_request/four_card/context_parallel/test_accuracy_v2.py: 1060
   tests/e2e/pull_request/four_card/context_parallel/test_deepseek_v4.py: 1230
   tests/e2e/pull_request/four_card/context_parallel/test_prefix_caching_cp.py: 210
@@ -174,3 +176,7 @@ estimated_times:
   # Conservative scheduling estimate; refine after the first A5 run.
   tests/e2e/pull_request/one_card/test_mla_fp8_decode_layout_a5.py: 180
   tests/e2e/pull_request/one_card/test_glm5next_pooled_cache_write.py: 30
+  # Bootstrap estimate; refine after the first NPU run.
+  tests/e2e/pull_request/one_card/test_dflash_context_kv_pad_slots.py: 600
+  tests/e2e/pull_request/one_card/test_dflash_fia_seq_lens_cpu.py: 600
+  tests/e2e/pull_request/one_card/test_v2_input_staging.py: 600

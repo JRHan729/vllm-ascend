@@ -1339,7 +1339,7 @@ def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp(a5, architecture)
     create_kvpp.assert_called_once()
     assert runner.kvpp == "kvpp"
     assert runner.model_state.kvpp_runtime == "kvpp"
-    assert runner.pcp_manager.vllm_config is runner.vllm_config
+    runner.pcp_manager.bind_config.assert_called_once_with(runner.vllm_config)
     assert runner.model_state.pcp_manager is runner.pcp_manager
 
 
@@ -1654,6 +1654,41 @@ def test_prepare_inputs_common_path():
     np.testing.assert_array_equal(runner.input_buffers.seq_lens_cpu[:2], np.array([3, 4], dtype=np.int32))
 
 
+def test_input_staging_submits_layout_before_waiting_for_corrected_lengths():
+    runner, output, batch, desc = _prepare_inputs_runner(draft=True, speculator=True)
+    calls = []
+
+    def stage(mapping, logits, query, query_out):
+        calls.append("stage")
+        query_out.copy_(torch.from_numpy(query))
+        return torch.from_numpy(mapping.copy()), torch.from_numpy(logits.copy())
+
+    runner.batch_input_staging = SimpleNamespace(copy=MagicMock(side_effect=stage))
+    runner.num_computed_tokens_event.synchronize.side_effect = lambda: calls.append("length_wait")
+    _run_prepare_inputs(runner, output, batch, desc)
+    assert calls == ["stage", "length_wait"]
+    runner.batch_input_staging.copy.assert_called_once()
+    assert runner.input_buffers.seq_lens_cpu[:2].tolist() == [5, 4]
+
+
+@pytest.mark.parametrize("partition", ["pp", "pcp", "ubatch"])
+def test_input_staging_is_bypassed_for_partitioned_execution(partition):
+    runner, output, batch, desc = _prepare_inputs_runner(draft=True, speculator=True)
+    runner.batch_input_staging = SimpleNamespace(copy=MagicMock())
+    if partition == "pp":
+        runner.use_pp = True
+    elif partition == "pcp":
+        runner.pcp_manager = SimpleNamespace(
+            get_global_graph_num_reqs=lambda _: None,
+            partition_batch=lambda input_batch, batch_desc: input_batch,
+        )
+    else:
+        desc.num_ubatches = 2
+    _run_prepare_inputs(runner, output, batch, desc)
+    runner.batch_input_staging.copy.assert_not_called()
+    runner.num_computed_tokens_event.synchronize.assert_called_once_with()
+
+
 @pytest.mark.parametrize("num_spec_tokens", [0, 1, 5])
 @pytest.mark.parametrize("full_cg", [False, True])
 def test_pd_tail_input_survives_upstream_decode_graph_classification(num_spec_tokens, full_cg):
@@ -1935,6 +1970,28 @@ def test_init_kv_zero_meta_uses_tuple_aware_zeroer_without_mxfp8():
     generic_cls.assert_called_once()
     assert runner.kv_block_zeroer is generic_cls.return_value
     assert not isinstance(runner.kv_block_zeroer, C8KVBlockZeroer)
+
+
+def test_init_kv_zero_meta_excludes_only_registered_topk_components():
+    import vllm_ascend.worker.v2.model_runner as model_runner_mod
+
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.vllm_config = SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="auto"))
+    runner.device = torch.device("cpu")
+    runner.attn_groups = []
+    runner.kernel_block_sizes = [128]
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner.kv_cache_config = SimpleNamespace(num_blocks=5856)
+    runner.cache_config = SimpleNamespace(cache_dtype="auto")
+    exclusions = {("target", 4), ("target", 5), ("draft", 4), ("draft", 5)}
+    runner.sparse_kv_offload_manager = SimpleNamespace(get_topk_cache_components=Mock(return_value=exclusions))
+
+    with patch.object(model_runner_mod, "AscendV2KVBlockZeroer") as cls:
+        runner._init_kv_zero_meta()
+
+    runner.sparse_kv_offload_manager.get_topk_cache_components.assert_called_once_with()
+    assert cls.call_args.kwargs["excluded_cache_components"] == exclusions
+    assert "runner_only_attn_layers" not in cls.call_args.kwargs
 
 
 def test_shutdown_releases_c8_views_and_unwraps_zeroer():
