@@ -135,6 +135,47 @@ class TestAttentionGraphHelpers(TestBase):
             self.assertTrue(using_paged_attention(None, vllm_config, head_size=FIA_TND_LARGE_HEAD_FALLBACK_HEAD_SIZE))
 
 
+@pytest.mark.parametrize("boundaries", [[0, 1, 2, 3], [0, 8, 16, 24], [0, 8, 16, 16]])
+def test_dense_query_boundaries_reuse_current_device_view(monkeypatch, boundaries):
+    builder = AscendAttentionMetadataBuilder.__new__(AscendAttentionMetadataBuilder)
+    builder.supports_update_block_table = True
+    builder.use_pcp = False
+    builder.device = torch.device("cpu")
+    builder.kv_cache_spec = None
+    builder.speculative_config = None
+    builder.vllm_config = SimpleNamespace(use_v2_model_runner=True)
+    builder.model_config = SimpleNamespace(runner_type="generate")
+    builder.attn_mask_builder = SimpleNamespace(get_attention_mask=lambda *args: None)
+    builder._split_decodes_and_prefills = lambda common: (3, 0, boundaries[-1], 0)
+    host = torch.tensor(boundaries, dtype=torch.int32)
+    device = torch.tensor(boundaries + [999], dtype=torch.int32)
+    lengths = torch.tensor([20, 30, 1], dtype=torch.int32)
+    common = SimpleNamespace(
+        num_reqs=3,
+        num_actual_tokens=boundaries[-1],
+        query_start_loc_cpu=host,
+        query_start_loc=device,
+        block_table_tensor=torch.zeros((3, 2), dtype=torch.int32),
+        slot_mapping=torch.arange(boundaries[-1], dtype=torch.int32),
+        attn_state=AscendAttentionState.DecodeOnly,
+        causal=True,
+        max_query_len=8,
+        seq_lens=lengths,
+        is_prefilling=None,
+        num_input_tokens=boundaries[-1],
+    )
+    monkeypatch.setattr(attn_module, "_select_seq_lens", lambda *args, **kwargs: lengths)
+    metadata = builder.build(0, common)
+    torch.testing.assert_close(metadata.query_start_loc, host)
+    assert metadata.query_start_loc.numel() == 4
+    assert metadata.query_start_loc_gpu is device
+    assert metadata.query_start_loc.data_ptr() == device.data_ptr()
+    # Contents still come from the runner's current input, not a host cache.
+    device[1] += 1
+    assert metadata.query_start_loc[1] == device[1]
+    assert host[1] == boundaries[1]
+
+
 class TestAscendAttentionBackend(TestBase):
     def test_get_name(self):
         self.assertEqual(AscendAttentionBackend.get_name(), "CUSTOM")
@@ -215,14 +256,6 @@ class TestAscendAttentionMetadataBuilder(TestBase):
         self.mock_device = "cpu:0"
         torch.Tensor.pin_memory = lambda x: x  # noqa
         self.builder = AscendAttentionMetadataBuilder(None, None, self.mock_vllm_config, self.mock_device)
-
-    def test_reorder_batch(self):
-        mock_input_batch = MagicMock()
-        mock_scheduler_output = MagicMock()
-
-        result = self.builder.reorder_batch(mock_input_batch, mock_scheduler_output)
-
-        self.assertFalse(result)
 
     def test_pcp_mode_is_initialized_from_config(self):
         self.assertFalse(self.builder.use_pcp)
@@ -708,7 +741,7 @@ class TestAscendAttentionBackendImpl(TestBase):
         metadata.actual_seq_lengths_q = [2]
         metadata.causal = True
         metadata.attn_mask = None
-        mock_get_forward_context.return_value = MagicMock(capturing=False)
+        mock_get_forward_context.return_value = MagicMock(capturing=False, additional_kwargs={"capturing": False})
 
         with patch(LARGE_HEAD_PREFILL_PATH, return_value=(torch.ones_like(query), None)) as mock_forward:
             result = self.impl_large_head.forward_impl(query, key, value, (), metadata, output)
@@ -851,6 +884,22 @@ class TestAscendAttentionBackendImpl(TestBase):
 
         assert output.shape == (10, 8 * 64)
 
+    def test_forward_pooling_encoder_only_is_bidirectional_despite_causal_metadata(self):
+        self.impl.attn_type = attn_module.AttentionType.ENCODER_ONLY
+        query = torch.zeros(2, self.impl.num_heads, self.impl.head_size)
+        output = torch.zeros_like(query)
+        encoder_output = torch.ones_like(query)
+        metadata = AscendMetadata(model_runner_type="pooling", causal=True, actual_seq_lengths_q=[query.shape[0]])
+
+        with (
+            patch("torch_npu.npu_fusion_attention", return_value=(encoder_output,)) as encoder_attention,
+            patch.object(self.impl, "forward_impl", return_value=output),
+        ):
+            result = self.impl.forward(self.layer_no_quant, query, query, query, (), metadata, output)
+
+        encoder_attention.assert_called_once()
+        torch.testing.assert_close(result, encoder_output)
+
     @patch("torch_npu.npu_scatter_pa_kv_cache")
     @patch("torch_npu.npu_fused_infer_attention_score")
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
@@ -877,7 +926,7 @@ class TestAscendAttentionBackendImpl(TestBase):
         metadata.slot_mapping = torch.zeros(10, dtype=torch.long)
         layer = self.layer_no_quant
 
-        mock_get_forward_context.return_value = MagicMock(capturing=False)
+        mock_get_forward_context.return_value = MagicMock(capturing=False, additional_kwargs={"capturing": False})
         mock_npu_fused_infer_attention_score.return_value = (torch.ones(10, 8, 64), torch.ones(10, 8, 64))
         output = self.impl.forward(layer, query, key, value, kv_cache, metadata, output)
 
@@ -935,7 +984,7 @@ class TestAscendAttentionBackendImpl(TestBase):
         kv_cache = torch.empty(2, 5, 128, 8, 64)
         output = torch.empty(10, 8, 64)
 
-        mock_get_forward_context.return_value = MagicMock(capturing=False)
+        mock_get_forward_context.return_value = MagicMock(capturing=False, additional_kwargs={"capturing": False})
 
         metadata = self.attn_metadata
         metadata.attn_state = AscendAttentionState.DecodeOnly

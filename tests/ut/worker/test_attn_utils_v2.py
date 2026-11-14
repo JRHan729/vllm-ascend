@@ -21,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu import attn_utils as upstream_attn_utils
+from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridAttnMetadata
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.attention import dsa_attn_kv_plan, dsa_v1
@@ -33,12 +34,12 @@ from vllm_ascend.attention.attention_v1 import (
     AscendC8AttentionBackendImpl,
 )
 from vllm_ascend.attention.context_parallel.attention_cp import AscendAttentionDCPImpl
-from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import (
     AscendDSAC4Backend,
     AscendDSAC4StateBackend,
     AscendDSAC128Backend,
     AscendDSAC128StateBackend,
+    AscendDSAIndexerBackend,
     AscendDSAMetadataBuilder,
     AscendDSASWABackend,
 )
@@ -50,10 +51,11 @@ from vllm_ascend.core.kv_cache_interface import (
     get_storage_block_size,
 )
 from vllm_ascend.device.hardware import AscendDeviceType
-from vllm_ascend.device.hardware_profile import HardwareCapability, get_hardware_profile
+from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.models.deepseek_v4 import compressor as deepseek_v4_compressor
 from vllm_ascend.models.deepseek_v4 import indexer as deepseek_v4_indexer
 from vllm_ascend.models.deepseek_v4 import model as deepseek_v4_model
+from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionMetadataBuilder
 from vllm_ascend.patch.platform.patch_kv_cache_utils import (
     _get_kv_cache_config_deepseek_v4_main,
 )
@@ -71,6 +73,264 @@ class SparseAttentionBackend(AscendAttentionBackend):
     @classmethod
     def is_sparse(cls) -> bool:
         return True
+
+
+class _RecordingGDNReuseBuilder(AscendGDNAttentionMetadataBuilder):
+    def __init__(self):
+        self.supports_update_block_table = True
+        self.num_spec = 3
+        self.use_spec_decode = True
+        self.use_full_cuda_graph = False
+        self.decode_cudagraph_max_bs = 64
+        self.vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(mamba_cache_mode="none"),
+            parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
+        )
+        self.build_calls = []
+        self.update_calls = []
+
+    def build(self, common_prefix_len, common_attn_metadata, **kwargs):
+        self.build_calls.append((common_attn_metadata, kwargs))
+        return SimpleNamespace(
+            batch=common_attn_metadata.query_start_loc,
+            block_table=common_attn_metadata.block_table_tensor,
+        )
+
+    def build_for_cudagraph_capture(self, common_attn_metadata, **kwargs):
+        return self.build(0, common_attn_metadata, **kwargs)
+
+    def update_block_table(self, metadata, blk_table, slot_mapping=None, graph_state_updates=None):
+        self.update_calls.append(metadata)
+        if graph_state_updates is not None:
+            graph_state_updates.append(blk_table)
+        return SimpleNamespace(batch=metadata.batch, block_table=blk_table)
+
+
+def _make_gdn_reuse_inputs(num_groups):
+    spec = MambaSpec(block_size=16, shapes=((1,), (1,)), dtypes=(torch.float32,), num_speculative_blocks=3)
+    builders = [_RecordingGDNReuseBuilder() for _ in range(num_groups)]
+    for builder in builders:
+        builder.kv_cache_spec = spec
+    groups = [
+        SimpleNamespace(
+            kv_cache_spec=spec,
+            layer_names=[f"layer{i}"],
+            get_metadata_builder=lambda _index, builder=builder: builder,
+        )
+        for i, builder in enumerate(builders)
+    ]
+    query_start_loc = torch.tensor([0, 4, 8], dtype=torch.int32)
+    accepted = torch.tensor([2, 3], dtype=torch.int32)
+    drafts = torch.tensor([3, 3], dtype=torch.int32)
+    is_prefilling = torch.zeros(2, dtype=torch.bool)
+    model_specific = SimpleNamespace(
+        get_extra_common_attn_kwargs=lambda _group, n: {"is_prefilling": is_prefilling[:n]},
+        get_extra_attn_kwargs=lambda _builder, n: {
+            "num_accepted_tokens": accepted[:n],
+            "num_decode_draft_tokens_cpu": drafts[:n],
+        },
+    )
+    kwargs = dict(
+        attn_groups=[[group] for group in groups],
+        num_reqs=2,
+        num_tokens=8,
+        query_start_loc_gpu=query_start_loc,
+        query_start_loc_cpu=query_start_loc,
+        max_query_len=4,
+        seq_lens=torch.tensor([24, 48], dtype=torch.int32),
+        max_seq_len=48,
+        block_tables=tuple(torch.arange(8, dtype=torch.int32).view(2, 4) + i * 100 for i in range(num_groups)),
+        slot_mappings=torch.arange(num_groups * 8, dtype=torch.int64).view(num_groups, 8),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=groups),
+        seq_lens_cpu_upper_bound=torch.tensor([24, 48], dtype=torch.int32),
+        model_specific_attn_metadata=model_specific,
+    )
+    return builders, kwargs
+
+
+@pytest.mark.parametrize("num_groups", [2, 38])
+@pytest.mark.parametrize("for_capture", [False, True])
+def test_standard_mamba_common_fields_follow_each_current_batch(num_groups, for_capture, monkeypatch):
+    builders, kwargs = _make_gdn_reuse_inputs(num_groups)
+    provider = MambaHybridAttnMetadata(
+        is_prefilling=torch.tensor([False, True]),
+        num_accepted_tokens=torch.tensor([2, 3], dtype=torch.int32),
+        num_decode_draft_tokens_cpu=torch.tensor([3, 3], dtype=torch.int32),
+    )
+    kwargs["model_specific_attn_metadata"] = provider
+    kwargs["for_cudagraph_capture"] = for_capture
+    original = MambaHybridAttnMetadata.get_extra_common_attn_kwargs
+    calls = []
+
+    def record_common_fields(self, group, num_reqs):
+        calls.append((group, num_reqs))
+        return original(self, group, num_reqs)
+
+    monkeypatch.setattr(MambaHybridAttnMetadata, "get_extra_common_attn_kwargs", record_common_fields)
+    # Disable builder reuse to inspect the common fields for every cache group.
+    for builder in builders:
+        builder.supports_update_block_table = False
+    for step, num_reqs in enumerate((2, 1, 2)):
+        provider.is_prefilling = torch.tensor([bool(step % 2), bool((step + 1) % 2)])
+        kwargs["num_reqs"] = num_reqs
+        attn_utils.build_attn_metadata(**kwargs)
+        common = [builder.build_calls[-1][0] for builder in builders]
+        assert all(metadata.is_prefilling is common[0].is_prefilling for metadata in common)
+        assert torch.equal(common[0].is_prefilling, provider.is_prefilling[:num_reqs])
+        assert common[0].is_prefilling.data_ptr() == provider.is_prefilling.data_ptr()
+    assert calls == [(0, 2), (0, 1), (0, 2)]
+
+
+def test_mamba_instance_common_override_keeps_group_specific_fields():
+    builders, kwargs = _make_gdn_reuse_inputs(2)
+    provider = MambaHybridAttnMetadata(is_prefilling=torch.zeros(2, dtype=torch.bool))
+    masks = [torch.zeros(2, dtype=torch.bool), torch.ones(2, dtype=torch.bool)]
+    fields = [{"is_prefilling": masks[i], "num_computed_tokens_cpu": torch.full((2,), i)} for i in range(2)]
+    override = MagicMock(side_effect=lambda group, n: fields[group].copy())
+    provider.get_extra_common_attn_kwargs = override
+    kwargs["model_specific_attn_metadata"] = provider
+    attn_utils.build_attn_metadata(**kwargs)
+    assert [entry.args for entry in override.call_args_list] == [(0, 2), (1, 2)]
+    for i, builder in enumerate(builders):
+        common = builder.build_calls[0][0]
+        assert common.is_prefilling is masks[i]
+        assert torch.equal(common.num_computed_tokens_cpu, torch.full((2,), i))
+        assert set(fields[i]) == {"is_prefilling", "num_computed_tokens_cpu"}
+
+
+@pytest.mark.parametrize("for_capture", [False, True])
+def test_custom_gdn_provider_keeps_group_builds_separate(for_capture):
+    builders, kwargs = _make_gdn_reuse_inputs(24)
+    kwargs["for_cudagraph_capture"] = for_capture
+    for _ in range(2):
+        result = attn_utils.build_attn_metadata(**kwargs)
+        assert len({id(metadata) for metadata in result.values()}) == 24
+        for i, metadata in enumerate(result.values()):
+            assert metadata.block_table is kwargs["block_tables"][i]
+            assert metadata.batch is result["layer0"].batch
+    assert len(builders[0].build_calls) == 2
+    assert all(len(builder.build_calls) == 2 for builder in builders)
+    assert all(not builder.update_calls for builder in builders)
+
+
+@pytest.mark.parametrize("for_capture", [False, True])
+def test_batch_global_mamba_gdn_groups_reuse_during_capture_and_replay(for_capture, monkeypatch):
+    builders, kwargs = _make_gdn_reuse_inputs(24)
+    kwargs["model_specific_attn_metadata"] = MambaHybridAttnMetadata(
+        is_prefilling=torch.zeros(2, dtype=torch.bool),
+        num_accepted_tokens=torch.tensor([2, 3], dtype=torch.int32),
+        num_decode_draft_tokens_cpu=torch.tensor([3, 3], dtype=torch.int32),
+    )
+    provider = kwargs["model_specific_attn_metadata"]
+    extra_inputs = MagicMock(wraps=provider.get_extra_attn_kwargs)
+    monkeypatch.setattr(provider, "get_extra_attn_kwargs", extra_inputs)
+    common_builds = MagicMock(wraps=attn_utils.AscendCommonAttentionMetadata)
+    monkeypatch.setattr(attn_utils, "AscendCommonAttentionMetadata", common_builds)
+    kwargs["for_cudagraph_capture"] = for_capture
+    result = attn_utils.build_attn_metadata(**kwargs)
+    assert len(builders[0].build_calls) == 1
+    assert all(not builder.build_calls and len(builder.update_calls) == 1 for builder in builders[1:])
+    for i, metadata in enumerate(result.values()):
+        assert metadata.block_table is kwargs["block_tables"][i]
+    assert extra_inputs.call_count == (0 if for_capture else 1)
+    assert common_builds.call_count == 1
+
+
+@pytest.mark.parametrize("for_capture", [False, True])
+def test_v2_flushes_group_graph_writes_once_before_return(for_capture):
+    builders, kwargs = _make_gdn_reuse_inputs(24)
+    kwargs["model_specific_attn_metadata"] = MambaHybridAttnMetadata(
+        is_prefilling=torch.zeros(2, dtype=torch.bool),
+        num_accepted_tokens=torch.tensor([2, 3], dtype=torch.int32),
+        num_decode_draft_tokens_cpu=torch.tensor([3, 3], dtype=torch.int32),
+    )
+    for builder in builders:
+        builder.graph_state_updater = MagicMock()
+    result = attn_utils.build_attn_metadata(**kwargs, for_cudagraph_capture=for_capture)
+    builders[0].graph_state_updater.apply.assert_called_once()
+    updates = builders[0].graph_state_updater.apply.call_args.args[0]
+    assert len(updates) == 23
+    for i, update in enumerate(updates, 1):
+        assert update is kwargs["block_tables"][i]
+        assert result[f"layer{i}"].block_table is update
+    assert all(not builder.graph_state_updater.apply.called for builder in builders[1:])
+
+
+@pytest.mark.parametrize("shared_capture", [False, True])
+def test_gdn_provider_changes_preserve_capture_contract(shared_capture):
+    builders, kwargs = _make_gdn_reuse_inputs(2)
+    custom_provider = kwargs["model_specific_attn_metadata"]
+    standard_provider = MambaHybridAttnMetadata(
+        is_prefilling=torch.zeros(2, dtype=torch.bool),
+        num_accepted_tokens=torch.ones(2, dtype=torch.int32),
+        num_decode_draft_tokens_cpu=torch.full((2,), 3, dtype=torch.int32),
+    )
+    kwargs["model_specific_attn_metadata"] = standard_provider if shared_capture else custom_provider
+    attn_utils.build_attn_metadata(**kwargs, for_cudagraph_capture=True)
+    kwargs["model_specific_attn_metadata"] = custom_provider if shared_capture else standard_provider
+    if shared_capture:
+        with pytest.raises(ValueError, match="batch-global Mamba provider"):
+            attn_utils.build_attn_metadata(**kwargs)
+        assert len(builders[0].build_calls) == 1
+    else:
+        attn_utils.build_attn_metadata(**kwargs)
+        assert all(len(builder.build_calls) == 2 for builder in builders)
+        assert all(not builder.update_calls for builder in builders)
+
+
+@pytest.mark.parametrize(
+    "difference",
+    [
+        "disabled",
+        "spec_width",
+        "prefill",
+        "extra_common",
+        "accepted",
+        "draft",
+        "cache_mode",
+        "extra_builder",
+        "pcp",
+    ],
+)
+def test_gdn_reuse_keeps_different_group_semantics_separate(difference):
+    builders, kwargs = _make_gdn_reuse_inputs(2)
+    if difference in ("disabled", "spec_width", "cache_mode", "pcp"):
+        kwargs["model_specific_attn_metadata"] = MambaHybridAttnMetadata(
+            is_prefilling=torch.zeros(2, dtype=torch.bool),
+            num_accepted_tokens=torch.ones(2, dtype=torch.int32),
+            num_decode_draft_tokens_cpu=torch.full((2,), 3, dtype=torch.int32),
+        )
+    if difference == "disabled":
+        builders[1].supports_update_block_table = False
+    elif difference == "spec_width":
+        spec = replace(builders[1].kv_cache_spec, num_speculative_blocks=7)
+        builders[1].kv_cache_spec = kwargs["attn_groups"][1][0].kv_cache_spec = spec
+    elif difference == "prefill":
+        masks = [torch.zeros(2, dtype=torch.bool), torch.ones(2, dtype=torch.bool)]
+        kwargs["model_specific_attn_metadata"].get_extra_common_attn_kwargs = lambda group, n: {
+            "is_prefilling": masks[group][:n]
+        }
+    elif difference == "extra_common":
+        kwargs["model_specific_attn_metadata"].get_extra_common_attn_kwargs = lambda group, n: {
+            "num_computed_tokens_cpu": torch.full((n,), group, dtype=torch.int32)
+        }
+    elif difference in ("accepted", "draft"):
+        accepted = [torch.tensor([1, 2]), torch.tensor([2, 3])]
+        drafts = [torch.tensor([3, 3]), torch.tensor([1, 3])]
+        kwargs["model_specific_attn_metadata"].get_extra_attn_kwargs = lambda builder, n: {
+            "num_accepted_tokens": accepted[builders.index(builder) if difference == "accepted" else 0][:n],
+            "num_decode_draft_tokens_cpu": drafts[builders.index(builder) if difference == "draft" else 0][:n],
+        }
+    elif difference == "cache_mode":
+        spec = replace(builders[1].kv_cache_spec, mamba_cache_mode="align")
+        builders[1].kv_cache_spec = kwargs["attn_groups"][1][0].kv_cache_spec = spec
+    elif difference == "extra_builder":
+        kwargs["model_specific_attn_metadata"].get_extra_attn_kwargs = lambda builder, n: {"group_specific": 1}
+    else:
+        kwargs["pcp_context"] = object()
+    attn_utils.build_attn_metadata(**kwargs)
+    assert all(len(builder.build_calls) == 1 for builder in builders)
+    assert all(not builder.update_calls for builder in builders)
 
 
 def _make_kv_cache_tensor(size: int, layer_names: list[str], page_size: int = 0) -> KVCacheTensor:
@@ -497,148 +757,6 @@ def test_mrv2_attention_views_interleave_kv_per_physical_page():
     assert torch.count_nonzero(raw_typed[2 * physical_page_elements :]) == 8
 
 
-@pytest.mark.parametrize("connector", ["MooncakeConnectorV2", "MooncakePullConnector"])
-def test_v2_mla_single_raw_backing_selects_layout_by_resolved_backend(monkeypatch, connector):
-    layer_name = "model.layers.0.self_attn.attn"
-    num_blocks = 2
-    spec = AscendMLAAttentionSpec(
-        block_size=384,
-        num_heads=64,
-        num_kv_heads=1,
-        head_size=576,
-        dtype=torch.bfloat16,
-        page_size_padded=488448,
-    )
-    attn_module = MLAAttention.__new__(MLAAttention)
-    torch.nn.Module.__init__(attn_module)
-    attn_module.kv_lora_rank = 512
-    attn_module.qk_rope_head_dim = 64
-    attn_module.impl = SimpleNamespace(
-        fa_quant_layer=False,
-        supports_prolog_v3_writer=lambda: False,
-        supports_strided_mla_writer=lambda: True,
-        use_flashmla=True,
-    )
-    backend = MagicMock()
-    backend.get_kv_cache_shape.side_effect = lambda num_block_ids, block_size, num_kv_heads, head_size, *_args: (
-        num_block_ids,
-        block_size,
-        num_kv_heads,
-        head_size,
-    )
-    attn_module.get_attn_backend = lambda: backend
-
-    vllm_config = SimpleNamespace(
-        additional_config={},
-        cache_config=SimpleNamespace(cache_dtype="auto"),
-        compilation_config=SimpleNamespace(static_forward_context={layer_name: attn_module}),
-        kv_transfer_config=None,
-        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
-        quant_config=None,
-    )
-    kv_cache_config = KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=[_make_kv_cache_tensor(num_blocks * 488448, [layer_name], 488448)],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=[layer_name], kv_cache_spec=spec)],
-    )
-    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: vllm_config)
-    monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda *_args, **_kwargs: {layer_name: attn_module})
-    monkeypatch.setattr(attn_utils, "_is_dsv4_model", lambda _config: False)
-    monkeypatch.setattr(attn_utils, "enable_sfa", lambda *_args, **_kwargs: False)
-    monkeypatch.setattr(attn_utils, "enable_fa_quant", lambda *_args, **_kwargs: False)
-
-    raw_caches = attn_utils._allocate_kv_cache(kv_cache_config, shared_layers={}, device=torch.device("cpu"))
-    assert isinstance(raw_caches[layer_name], tuple)
-    assert len(raw_caches[layer_name]) == 1
-    (raw_cache,) = raw_caches[layer_name]
-    assert raw_cache.numel() == num_blocks * 488448
-
-    flash_profile = SimpleNamespace(supports=lambda capability: capability is HardwareCapability.MLA_FLASH)
-    component_profile = SimpleNamespace(supports=lambda capability: False)
-
-    def reshape():
-        # Build both consumers from the current spec each time. The reshape
-        # path reads the group directly and resolves layer specs through
-        # KVCacheConfig, so mutating either object is not a reliable test
-        # primitive.
-        current_config = replace(
-            kv_cache_config,
-            kv_cache_groups=[
-                KVCacheGroupSpec(layer_names=[layer_name], kv_cache_spec=spec),
-            ],
-        )
-        return attn_utils._reshape_kv_cache_v2(
-            attn_groups=[
-                AttentionGroup(
-                    backend=backend,
-                    layer_names=[layer_name],
-                    kv_cache_spec=spec,
-                    kv_cache_group_id=0,
-                )
-            ],
-            kv_cache_raw_tensors=raw_caches,
-            cache_dtype="auto",
-            kernel_block_sizes=[128],
-            shared_kv_cache_layers={},
-            kv_cache_config=current_config,
-        )[layer_name]
-
-    monkeypatch.setattr(attn_utils, "get_current_hardware_profile", lambda: flash_profile)
-    for q_heads in (8, 12, 64, 96):
-        spec = replace(spec, num_heads=q_heads)
-        fused = reshape()
-        assert isinstance(fused, torch.Tensor)
-        assert fused.shape == (6, 128, 1, 576)
-        assert fused.stride() == (81408, 576, 576, 1)
-
-    # The resolved backend rejects unsupported query-head counts before cache
-    # allocation, so FIA receives the component-major view even on A5.
-    spec = replace(spec, num_heads=48)
-    attn_module.impl.use_flashmla = False
-    a5_fallback = reshape()
-    assert isinstance(a5_fallback, tuple)
-
-    # Missing FlashMLA APIs in the active CANN package also select the
-    # FIA-compatible component-major layout.
-    # Backend selection has already resolved missing operator APIs to FIA.
-    attn_module.impl.use_flashmla = False
-    spec = replace(spec, num_heads=64)
-    missing_flashmla_ops = reshape()
-    assert isinstance(missing_flashmla_ops, tuple)
-
-    # Preserve the external reader's token-fused PD contract. Native FIA
-    # still receives component-major pages when FlashMLA is not selected.
-    attn_module.impl.use_flashmla = True
-    vllm_config.kv_transfer_config = SimpleNamespace(
-        kv_connector=connector,
-        kv_connector_module_path=None,
-        kv_connector_extra_config={
-            "prefill": {"tp_size": 2},
-            "decode": {"tp_size": 1},
-        },
-    )
-    unequal_pd_cache = reshape()
-    assert isinstance(unequal_pd_cache, torch.Tensor)
-    assert unequal_pd_cache.shape == (6, 128, 1, 576)
-    assert unequal_pd_cache.stride() == (81408, 576, 576, 1)
-
-    vllm_config.kv_transfer_config.kv_connector_extra_config["decode"]["tp_size"] = 2
-    equal_pd_cache = reshape()
-    assert isinstance(equal_pd_cache, torch.Tensor)
-    vllm_config.kv_transfer_config = None
-    attn_module.impl.use_flashmla = False
-
-    monkeypatch.setattr(attn_utils, "get_current_hardware_profile", lambda: component_profile)
-    cache = reshape()
-    nope, rope = cache
-    assert nope.shape == (6, 128, 1, 512)
-    assert nope.stride() == (81408, 512, 512, 1)
-    assert rope.shape == (6, 128, 1, 64)
-    assert rope.stride() == (81408, 64, 64, 1)
-    assert rope.storage_offset() - nope.storage_offset() == 65536
-    assert nope.untyped_storage() is rope.untyped_storage()
-
-
 def test_v2_single_raw_mla_path_excludes_unsupported_modes(monkeypatch):
     layer_name = "model.layers.0.self_attn.attn"
     attn_module = MLAAttention.__new__(MLAAttention)
@@ -725,6 +843,20 @@ def test_v2_single_raw_mla_path_excludes_unsupported_modes(monkeypatch):
     assert not replace(spec, tokens_per_state=2).supports_single_raw_backing
     assert not replace(spec, model_version="deepseek_v4").supports_single_raw_backing
     assert not attn_utils._uses_single_raw_mla_cache(vllm_config, layer_name, blocked_spec)
+
+
+def test_v2_flashmla_draft_cache_uses_selected_reader_with_sparse_target(monkeypatch):
+    layer_name = "draft.model.layers.0.self_attn.attn"
+    target_config = SimpleNamespace(kv_transfer_config=None, sparse=True)
+    layer = MLAAttention.__new__(MLAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.impl = SimpleNamespace(use_flashmla=True)
+    spec = AscendMLAAttentionSpec(block_size=128, num_kv_heads=1, head_size=576, dtype=torch.bfloat16)
+    monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda *_args: {layer_name: layer})
+    monkeypatch.setattr(attn_utils, "enable_sfa", lambda config: config.sparse)
+    assert attn_utils._uses_single_raw_mla_cache(target_config, layer_name, spec)
+    layer.impl.use_flashmla = False
+    assert not attn_utils._uses_single_raw_mla_cache(target_config, layer_name, spec)
 
 
 def test_v2_zeroer_constructs_component_zeroers(monkeypatch):
@@ -834,6 +966,7 @@ def test_v2_model_runner_binds_tuple_aware_zeroer(monkeypatch):
         "static_forward_context": {},
         "num_blocks": 2,
         "cache_dtype": "auto",
+        "excluded_cache_components": set(),
     }
 
 
@@ -1101,6 +1234,7 @@ def test_gqa_pcp_dcp_cache_keeps_tp_local_kv_heads(monkeypatch, dcp_size):
     layer = SimpleNamespace(
         kv_sharing_target_layer_name=None,
         align_kv_cache_with_mamba=True,
+        is_draft_layer=False,
         get_kv_cache_spec=lambda _config: source_spec,
     )
     model_config = SimpleNamespace(
@@ -1144,8 +1278,6 @@ def test_draft_layer_specs_are_tagged_for_eagle_groups(monkeypatch, is_draft_lay
         head_size=128,
         dtype=torch.bfloat16,
     )
-    if not hasattr(source_spec, "is_draft"):
-        pytest.skip("vLLM release lane has no KVCacheSpec.is_draft")
     layer = SimpleNamespace(
         kv_sharing_target_layer_name=None,
         align_kv_cache_with_mamba=True,
@@ -1182,12 +1314,20 @@ def test_draft_layer_specs_are_tagged_for_eagle_groups(monkeypatch, is_draft_lay
     ("model_type", "expected_num_heads"),
     [("kimi_linear", 1), ("deepseek_v3", 12)],
 )
-def test_mla_cache_spec_uses_physical_heads_for_kimi_k3(monkeypatch, model_type, expected_num_heads):
+@pytest.mark.parametrize("dcp_sharded", [False, True])
+@pytest.mark.parametrize(("source_is_draft", "is_draft_layer"), [(False, False), (False, True), (True, False)])
+@pytest.mark.parametrize("non_causal", [False, True])
+def test_mla_cache_spec_uses_physical_heads_for_kimi_k3(
+    monkeypatch, model_type, expected_num_heads, source_is_draft, is_draft_layer, non_causal, dcp_sharded
+):
     source_spec = MLAAttentionSpec(
         block_size=128,
         num_kv_heads=1,
         head_size=576,
         dtype=torch.bfloat16,
+        is_draft=source_is_draft,
+        non_causal_multi_token_decode=non_causal,
+        dcp_sharded=dcp_sharded,
     )
     layer = MLAAttention.__new__(MLAAttention)
     layer.impl = SimpleNamespace(
@@ -1198,6 +1338,7 @@ def test_mla_cache_spec_uses_physical_heads_for_kimi_k3(monkeypatch, model_type,
     layer.num_heads = 12
     layer.model_version = None
     layer.indexes_kv_by_block_stride = False
+    layer.is_draft_layer = is_draft_layer
     layer.get_kv_cache_spec = lambda _config: source_spec
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
@@ -1216,14 +1357,23 @@ def test_mla_cache_spec_uses_physical_heads_for_kimi_k3(monkeypatch, model_type,
         "get_layers_from_vllm_config",
         lambda *_args, **_kwargs: {"model.layers.0.self_attn.attn": layer},
     )
-    monkeypatch.setattr(attn_utils, "enable_sfa", lambda _config: False)
+    monkeypatch.setattr(attn_utils, "enable_sfa", lambda _config: True)
+    monkeypatch.setattr(
+        attn_utils,
+        "get_ascend_config",
+        lambda: SimpleNamespace(sparse_kv_offload_config=SimpleNamespace(enabled=True)),
+    )
     monkeypatch.setattr(attn_utils, "enable_sfa_dcp_replicated_indexer", lambda _config: False)
 
     spec = attn_utils.get_kv_cache_spec(vllm_config)["model.layers.0.self_attn.attn"]
 
     assert isinstance(spec, AscendMLAAttentionSpec)
     assert spec.num_heads == expected_num_heads
+    assert spec.dcp_sharded is dcp_sharded
     assert spec.page_size_bytes == source_spec.page_size_bytes
+    assert spec.is_draft is (source_is_draft or is_draft_layer)
+    assert spec.store_on_host is not spec.is_draft
+    assert spec.non_causal_multi_token_decode is non_causal
 
 
 @pytest.mark.parametrize(
@@ -1233,8 +1383,9 @@ def test_mla_cache_spec_uses_physical_heads_for_kimi_k3(monkeypatch, model_type,
 @pytest.mark.parametrize("li_c8", [False, True])
 @pytest.mark.parametrize("li_c4", [False, True])
 @pytest.mark.parametrize("owner", ["unpaired", "static_shared", "mtp", "regular"])
+@pytest.mark.parametrize("dcp_sharded", [False, True])
 def test_sfa_indexer_cache_spec_runtime_ownership_and_dcp_replication(
-    monkeypatch, replicated_indexer, expected_size, li_c8, li_c4, owner
+    monkeypatch, replicated_indexer, expected_size, li_c8, li_c4, owner, dcp_sharded
 ):
     layer_name = "model.layers.0.self_attn.indexer.k_cache"
     indexer_module = DeepseekV32IndexerCache.__new__(DeepseekV32IndexerCache)
@@ -1242,7 +1393,9 @@ def test_sfa_indexer_cache_spec_runtime_ownership_and_dcp_replication(
     monkeypatch.setattr(
         indexer_module,
         "get_kv_cache_spec",
-        lambda _config: object(),
+        lambda _config: MLAAttentionSpec(
+            block_size=128, num_kv_heads=1, head_size=128, dtype=torch.bfloat16, dcp_sharded=dcp_sharded
+        ),
     )
     layers = {layer_name: indexer_module}
     if owner != "unpaired":
@@ -1295,6 +1448,7 @@ def test_sfa_indexer_cache_spec_runtime_ownership_and_dcp_replication(
     spec = specs[layer_name]
 
     assert isinstance(spec, AscendSFAIndexerCacheSpec)
+    assert spec.dcp_sharded is dcp_sharded
     assert spec.sfa_dcp_replicated_indexer_size == expected_size
     if li_c4:
         assert spec.head_size == 128 // 2
@@ -1536,20 +1690,6 @@ class _RecordingDSAMetadataBuilder(AscendDSAMetadataBuilder):
         self.calls.append(call)
         call["common_ratio_to_sas_metadata"].setdefault("first_group", len(self.calls) == 1)
         return SimpleNamespace(common_attn_metadata=common_attn_metadata)
-
-
-class _RecordingDSACPMetadataBuilder(AscendDSACPMetadataBuilder):
-    def __init__(self, calls: list[dict[str, Any]], compressor_ratio: int):
-        self.calls = calls
-        self.for_cudagraph_capture = False
-        self.tq_group_block_sizes = None
-        self.compressor_ratio = compressor_ratio
-
-    build = _RecordingDSAMetadataBuilder.build
-
-    def build_for_cudagraph_capture(self, common_attn_metadata, **kwargs):
-        self.for_cudagraph_capture = True
-        return self.build(common_prefix_len=0, common_attn_metadata=common_attn_metadata, **kwargs)
 
 
 def _make_dsa_metadata_groups(builder_cls=_RecordingDSAMetadataBuilder):
@@ -1951,7 +2091,7 @@ def test_dsv4_backends_declare_role_specific_logical_sizes(
     swa_cache = cast(deepseek_v4_model.AscendDeepseekV4SWACache, SimpleNamespace())
     c4_state = cast(deepseek_v4_compressor.AscendCompressorStateCache, c4_cache)
     c128_state = cast(deepseek_v4_compressor.AscendCompressorStateCache, c128_cache)
-    assert deepseek_v4_indexer.AscendDeepseekV4IndexerCache.get_attn_backend(c4_indexer) is AscendDSAC4Backend
+    assert deepseek_v4_indexer.AscendDeepseekV4IndexerCache.get_attn_backend(c4_indexer) is AscendDSAIndexerBackend
     assert deepseek_v4_indexer.AscendDeepseekV4IndexerCache.get_attn_backend(c128_indexer) is AscendDSAC128Backend
     assert deepseek_v4_model.AscendDeepseekV4SWACache.get_attn_backend(swa_cache) is AscendDSASWABackend
     assert deepseek_v4_compressor.AscendCompressorStateCache.get_attn_backend(c4_state) is AscendDSAC4StateBackend
@@ -1974,7 +2114,7 @@ def test_dsv4_backends_declare_role_specific_logical_sizes(
         ("pcp_runtime", CUDAGraphMode.NONE, False, 2, 8),
     ],
 )
-@pytest.mark.parametrize("builder_cls", [_RecordingDSAMetadataBuilder, _RecordingDSACPMetadataBuilder])
+@pytest.mark.parametrize("builder_cls", [_RecordingDSAMetadataBuilder])
 def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(
     monkeypatch,
     caller,
@@ -2004,6 +2144,7 @@ def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(
     pcp_manager = (
         SimpleNamespace(
             build_attention_context=MagicMock(return_value=pcp_context),
+            is_target_attn_groups=MagicMock(return_value=True),
         )
         if pcp_context is not None
         else None
@@ -2279,7 +2420,7 @@ def test_main_entry_allocates_and_reshapes_kvpp_views(monkeypatch, packed):
 
     from tests.ut.kvpp_utils import assert_attention_cache_views, make_attention_cache_case, make_cache_config
     from vllm_ascend.core import kv_cache_placement
-    from vllm_ascend.patch.worker.patch_v2 import patch_attn_utils
+    from vllm_ascend.patch.worker import patch_attn_utils
     from vllm_ascend.worker import kvpp_cache
 
     config, specs, layers = make_attention_cache_case(packed)
@@ -2320,16 +2461,16 @@ def _make_mla_layer(*, fa_quant: bool = False, sparse_c8: bool = False):
         enable_sparse_sfa_turboquant=False,
         dtype=torch.bfloat16,
     )
-    layer.get_kv_cache_spec = lambda _cfg: SimpleNamespace(
+    layer.get_kv_cache_spec = lambda _cfg: MLAAttentionSpec(
         block_size=16,
         # vLLM's generic MLA spec exposes cache head slots here, not local
         # query heads. The Ascend spec must deliberately use the module count.
-        num_heads=1,
         num_kv_heads=1,
         head_size=128,
         dtype=torch.bfloat16,
         cache_dtype_str="auto",
         model_version=None,
+        is_draft=False,
         non_causal_multi_token_decode=False,
         tokens_per_state=1,
     )
@@ -2399,16 +2540,29 @@ def test_v2_sparse_offload_marks_main_mla_cache_host_resident(monkeypatch):
     assert not attn_utils.get_kv_cache_spec(vllm_config)[layer_name].store_on_host
 
 
-def test_sfa_indexer_allocates_and_reshapes_scale_views(monkeypatch):
+@pytest.mark.parametrize("hybrid_backing", [False, True])
+@pytest.mark.parametrize(
+    "dtype,scale_dim,scale_dtype,dcp_size",
+    [
+        (torch.int8, 1, torch.float16, 1),
+        (torch.bfloat16, 0, torch.float16, 1),
+        (torch.float8_e4m3fn, 1, torch.float32, 1),
+        (torch.float8_e4m3fn, 1, torch.float32, 8),
+    ],
+)
+@pytest.mark.parametrize("kernel_parts", [1, 2])
+def test_sfa_indexer_allocates_and_reshapes_scale_views(
+    monkeypatch, hybrid_backing, dtype, scale_dim, scale_dtype, dcp_size, kernel_parts
+):
     layer_name = "model.layers.0.self_attn.indexer.k_cache"
     spec = AscendSFAIndexerCacheSpec(
-        block_size=2,
+        block_size=256,
         num_kv_heads=1,
         head_size=4,
-        dtype=torch.int8,
-        scale_dim=1,
-        scale_dtype=torch.float16,
-        sfa_dcp_replicated_indexer_size=1,
+        dtype=dtype,
+        scale_dim=scale_dim,
+        scale_dtype=scale_dtype,
+        sfa_dcp_replicated_indexer_size=dcp_size,
     )
     num_blocks = 2
     kv_cache_config = KVCacheConfig(
@@ -2433,9 +2587,14 @@ def test_sfa_indexer_allocates_and_reshapes_scale_views(monkeypatch):
     monkeypatch.setattr(attn_utils, "enable_sfa", lambda _cfg: False)
 
     raw = attn_utils._allocate_kv_cache(kv_cache_config, shared_layers={}, device=torch.device("cpu"))
-    raw_k, raw_scale = raw[layer_name]
+    raw_parts = raw[layer_name]
+    raw_k = raw_parts[0]
+    raw_scale = raw_parts[1] if scale_dim else None
     assert raw_k.dtype == torch.int8
-    assert raw_scale.dtype == torch.int8
+    if raw_scale is not None:
+        assert raw_scale.dtype == torch.int8
+    if hybrid_backing:
+        raw[layer_name] = torch.cat(raw_parts)
 
     backend = SimpleNamespace(
         get_kv_cache_shape=lambda num_blocks_, block_size, num_kv_heads, head_size: (
@@ -2457,14 +2616,86 @@ def test_sfa_indexer_allocates_and_reshapes_scale_views(monkeypatch):
         ],
         kv_cache_raw_tensors=raw,
         cache_dtype="auto",
-        kernel_block_sizes=[spec.block_size],
+        kernel_block_sizes=[spec.block_size // kernel_parts],
         shared_kv_cache_layers={"alias": layer_name},
         kv_cache_config=kv_cache_config,
     )
-    indexer_k, indexer_scale = caches[layer_name]
-    assert indexer_k.shape == (num_blocks, spec.block_size, spec.num_kv_heads, spec.head_size)
-    assert indexer_scale.shape == (num_blocks, spec.block_size, spec.num_kv_heads, spec.scale_dim)
+    parts = caches[layer_name]
+    indexer_k = parts[0]
+    assert indexer_k.shape == (
+        num_blocks * kernel_parts * dcp_size,
+        spec.block_size // kernel_parts,
+        spec.num_kv_heads,
+        spec.head_size,
+    )
+    assert indexer_k.dtype == dtype
+    assert len(parts) == (2 if scale_dim else 1)
+    if scale_dim:
+        indexer_scale = parts[1]
+        assert indexer_scale.shape == (
+            num_blocks * kernel_parts * dcp_size,
+            spec.block_size // kernel_parts,
+            spec.num_kv_heads,
+            spec.scale_dim,
+        )
     assert caches["alias"] is caches[layer_name]
+    if hybrid_backing:
+        assert indexer_k.data_ptr() == raw[layer_name].data_ptr()
+        if scale_dim:
+            key_page_bytes = raw_k.numel() // (num_blocks * kernel_parts * dcp_size)
+            assert parts[1].data_ptr() == raw[layer_name].data_ptr() + key_page_bytes
+            assert parts[1].dtype == scale_dtype
+            row_bytes = spec.page_size_bytes // (spec.block_size * dcp_size)
+            main = raw[layer_name].view(num_blocks, spec.block_size * dcp_size, 1, row_bytes)
+            main_spec = AscendMLAAttentionSpec(
+                block_size=spec.block_size * dcp_size, num_kv_heads=1, head_size=row_bytes, dtype=torch.int8
+            )
+            zeroer = AscendV2KVBlockZeroer(
+                torch.device("cpu"),
+                attn_groups_iter=[
+                    AttentionGroup(backend, [layer_name], spec, 0),
+                    AttentionGroup(backend, ["main"], main_spec, 1),
+                ],
+                kernel_block_sizes=[spec.block_size // kernel_parts, main_spec.block_size],
+                static_forward_context={
+                    layer_name: SimpleNamespace(kv_cache=parts),
+                    "main": SimpleNamespace(kv_cache=(main,)),
+                },
+                num_blocks=num_blocks,
+            )
+            # Use the real zeroer's address table and verify that recycling
+            # scheduler block 1 never clears the neighboring live block 0.
+            backing = raw[layer_name]
+            backing.fill_(23)
+            for component in zeroer._zeroers:
+                addresses, strides, spans, *_ = component._meta
+                for address, stride, span in zip(addresses.tolist(), strides.tolist(), spans.tolist()):
+                    offset = address - backing.data_ptr() + stride * 4
+                    backing[offset : offset + span * 4].zero_()
+            assert torch.all(backing[: spec.page_size_bytes] == 23)
+            assert torch.all(backing[spec.page_size_bytes :] == 0)
+
+
+@pytest.mark.parametrize("indexer_dtype,indexer_scale_dim", [(torch.bfloat16, 0), (torch.int8, 1)])
+def test_sparse_hybrid_page_alignment_preserves_native_component_pages(indexer_dtype, indexer_scale_dim):
+    specs = {
+        "main": AscendMLAAttentionSpec(block_size=128, num_kv_heads=1, head_size=576, dtype=torch.bfloat16),
+        "indexer": AscendSFAIndexerCacheSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=indexer_dtype,
+            scale_dim=indexer_scale_dim,
+            scale_dtype=torch.float16,
+        ),
+    }
+    original = dict(specs)
+    attn_utils._align_hybrid_attention_page_sizes(specs, minimum_page_size=800000)
+    # PR4's paired planner aligns recurrent states to main pages separately.
+    # Enlarging token blocks to equalize MLA/indexer bytes changes ownership.
+    assert specs == original
+    assert specs["main"].page_size_bytes == 147456
+    assert specs["indexer"].page_size_bytes == (32768 if indexer_scale_dim == 0 else 16640)
 
 
 def test_sfa_indexer_li_c4_allocates_and_reshapes_scale_views(monkeypatch):
@@ -2540,14 +2771,14 @@ def test_sfa_indexer_li_c4_allocates_and_reshapes_scale_views(monkeypatch):
 
 
 def test_attn_state_mla_spec_and_metadata_wrappers(monkeypatch):
-    encoder_spec = attn_utils.EncoderOnlyAttentionSpec.__new__(attn_utils.EncoderOnlyAttentionSpec)
     pooling_encoder = SimpleNamespace(
         model_config=SimpleNamespace(runner_type="pooling"),
     )
     pooling_other = SimpleNamespace(
         model_config=SimpleNamespace(runner_type="pooling"),
     )
-    encoder_kv_cache_config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=encoder_spec)])
+    # Encoder-only models (BERT/BGE) build no KV cache groups at all.
+    empty_kv_cache_config = SimpleNamespace(kv_cache_groups=[])
     other_kv_cache_config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=object())])
     mtp = SimpleNamespace(
         model_config=SimpleNamespace(runner_type="generate"),
@@ -2580,7 +2811,7 @@ def test_attn_state_mla_spec_and_metadata_wrappers(monkeypatch):
             2,
             seq,
             seq,
-            kv_cache_config=encoder_kv_cache_config,
+            kv_cache_config=empty_kv_cache_config,
         )
         is state.PrefillNoCache
     )
@@ -2792,6 +3023,7 @@ def _plain_full_attention_spec(head_size_v: int = 64) -> FullAttentionSpec:
 
 def _run_get_kv_cache_spec(monkeypatch, vllm_config, spec) -> dict:
     attn_module = SimpleNamespace(
+        is_draft_layer=False,
         get_kv_cache_spec=lambda _cfg: spec,
     )
     monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda _cfg, _type: {"attn": attn_module})
