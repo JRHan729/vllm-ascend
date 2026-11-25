@@ -9,8 +9,8 @@ import torch_npu  # noqa: F401
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.kv_cache_interface import MambaSpec
 
+from vllm_ascend.attention.gdn_attn_builder import AscendGDNAttentionMetadataBuilder
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
-from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionMetadataBuilder
 from vllm_ascend.ops.triton.mamba.graph_state import GDNGraphStateUpdater
 from vllm_ascend.worker.v2.model_states.mamba_hybrid import _compute_aligned_state_indices
 

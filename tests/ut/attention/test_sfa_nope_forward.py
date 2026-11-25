@@ -47,6 +47,7 @@ def test_nope_exec_kv_preserves_padding_and_special_values(block_size, dtype, sl
         kv_lora_rank=dim,
         kv_a_layernorm=lambda x: x,
         enable_sparse_sfa_c8=False,
+        enable_sparse_sfa_hif8=False,
     )
     impl._exec_kv_local = AscendSFAImpl._exec_kv_local.__get__(impl)
     native = sparse_mla.torch_npu.npu_scatter_nd_update_
@@ -71,6 +72,7 @@ def test_nope_exec_kv_trims_unused_slots_and_converts_values():
         kv_lora_rank=8,
         kv_a_layernorm=lambda x: x,
         enable_sparse_sfa_c8=False,
+        enable_sparse_sfa_hif8=False,
     )
     impl._exec_kv_local = AscendSFAImpl._exec_kv_local.__get__(impl)
     AscendSFAImpl.exec_kv(impl, values, None, None, (cache,), slots, None)
@@ -92,6 +94,7 @@ def test_nope_exec_kv_rejects_unmergeable_pages():
         kv_lora_rank=8,
         kv_a_layernorm=lambda x: x,
         enable_sparse_sfa_c8=False,
+        enable_sparse_sfa_hif8=False,
     )
     impl._exec_kv_local = AscendSFAImpl._exec_kv_local.__get__(impl)
     with (
@@ -299,7 +302,7 @@ def test_sparse_mla_full_forward_uses_real_rows_and_latent_values(graph_mode, em
         # field; indexer_kv_dtype now only drives the LI C8 indexer cache.
         # "int8" is what this test packs and what
         # _reference_quantized_sparse_attention asserts.
-        cache_config=SimpleNamespace(cache_dtype="int8"),
+        cache_config=SimpleNamespace(cache_dtype="int8" if enable_c8 else "auto"),
         attention_config=SimpleNamespace(indexer_kv_dtype="int8"),
     )
     ascend_config = SimpleNamespace(

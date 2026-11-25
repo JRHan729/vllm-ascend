@@ -49,8 +49,8 @@ examples and links together.
 | [spec_decode/resample.py](spec_decode/resample.py) | `worker/v2/spec_decode/rejection_sampler_utils.py` | [resample.md](docs/resample.md) |
 | [mamba/gdn_prepare.py](mamba/gdn_prepare.py) | `attention/gdn_attn_builder.py` | [gdn_prepare.md](docs/gdn_prepare.md) |
 | [mamba/aligned_indices.py](mamba/aligned_indices.py) | `worker/v2/model_states/mamba_hybrid.py` | [aligned_indices.md](docs/aligned_indices.md) |
-| [mamba/cached_decode.py](mamba/cached_decode.py) | `ops/gdn_attn_builder.py` | [cached_decode.md](docs/cached_decode.md) |
-| [mamba/graph_state.py](mamba/graph_state.py) | `ops/gdn_attn_builder.py` | [graph_state.md](docs/graph_state.md) |
+| [mamba/cached_decode.py](mamba/cached_decode.py) | `attention/gdn_attn_builder.py` | [cached_decode.md](docs/cached_decode.md) |
+| [mamba/graph_state.py](mamba/graph_state.py) | `attention/gdn_attn_builder.py` | [graph_state.md](docs/graph_state.md) |
 | [spec_decode/entropy_verify.py](spec_decode/entropy_verify.py) | `worker/v2/spec_decode/rejection_sampler_utils.py` | [entropy_verify.md](docs/entropy_verify.md) |
 
 ## Shared runner support
@@ -86,6 +86,7 @@ configuration rather than the runner input or sampling interface.
 | [compressor/compressor_triton.py](compressor/compressor_triton.py) | Model compression |
 | [dcp/dcp_a2a.py](dcp/dcp_a2a.py) | Distributed attention |
 | [dcp/dcp_a2a_batched.py](dcp/dcp_a2a_batched.py) | Distributed attention |
+| [dcp/dcp_a2a_rank_tiled.py](dcp/dcp_a2a_rank_tiled.py) | Distributed attention |
 | [dcp/sfa_dcp_exchange.py](dcp/sfa_dcp_exchange.py) | Model/attention primitive or shared utility |
 | [dcp/sfa_dcp_merge.py](dcp/sfa_dcp_merge.py) | Model/attention primitive or shared utility |
 | [sharded_indexer.py](sharded_indexer.py) | DCP candidate transport and causal metadata |
@@ -93,7 +94,7 @@ configuration rather than the runner input or sampling interface.
 | [engram_gate.py](engram_gate.py) | Model/attention primitive or shared utility |
 | [engram_hash.py](engram_hash.py) | Model/attention primitive or shared utility |
 | [engram_lookup.py](engram_lookup.py) | Model/attention primitive or shared utility |
-| [eplb.py](eplb.py) | Model/attention primitive or shared utility |
+| [eplb.py](eplb.py) | Distributed [EPLB mapping and load recording](docs/eplb.md) |
 | [fla/chunk.py](fla/chunk.py) | Linear attention |
 | [fla/chunk_delta_h.py](fla/chunk_delta_h.py) | Linear attention |
 | [fla/chunk_delta_hupdate.py](fla/chunk_delta_hupdate.py) | Linear attention |
@@ -155,7 +156,7 @@ configuration rather than the runner input or sampling interface.
 | [query_gather_prep.py](query_gather_prep.py) | Model/attention primitive or shared utility |
 | [qwen4_exp/fia.py](qwen4_exp/fia.py) | Model/attention primitive or shared utility |
 | [qwen4_exp/gbsa.py](qwen4_exp/gbsa.py) | Model/attention primitive or shared utility |
-| [qwen4_exp/hc.py](qwen4_exp/hc.py) | HyperConnection glue operators; row-block `gate_mix` is documented in [qwen4_exp_hc_gate_mix.md](docs/qwen4_exp_hc_gate_mix.md). |
+| [qwen4_exp/hc.py](qwen4_exp/hc.py) | HyperConnection glue operators; row-block `gate_mix` and final-injection `combine_final` are documented in [qwen4_exp_hc_gate_mix.md](docs/qwen4_exp_hc_gate_mix.md) and [qwen4_exp_hc_combine_final.md](docs/qwen4_exp_hc_combine_final.md). |
 | [qwen4_exp/qsa.py](qwen4_exp/qsa.py) | Model/attention primitive or shared utility |
 | [rms_norm.py](rms_norm.py) | Model/attention primitive or shared utility |
 | [rope.py](rope.py) | Model/attention primitive or shared utility |
