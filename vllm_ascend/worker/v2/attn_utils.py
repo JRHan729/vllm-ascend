@@ -436,6 +436,7 @@ def build_attn_metadata(
         positions = torch.zeros(num_input_tokens, dtype=torch.int64, device=query_start_loc_gpu.device)
 
     attn_metadata: dict[str, Any] = {}
+    step_metadata_builders: list[tuple[list[str], Any]] = []
     # Share request-level DSA metadata across cache groups in one execution.
     common_ratio_to_sas_metadata: dict[Any, Any] = {}
     common_v41_batch_metadata: dict[str, Any] = {}
@@ -533,6 +534,8 @@ def build_attn_metadata(
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(0)
+            if callable(getattr(attn_metadata_builder, "prepare_step_metadata", None)):
+                step_metadata_builders.append((attn_group.layer_names, attn_metadata_builder))
             is_dsa_builder = isinstance(attn_metadata_builder, AscendDSAMetadataBuilder)
             is_v41_builder = isinstance(attn_metadata_builder, AscendDSAV41MetadataBuilder)
             is_sfa_builder = isinstance(attn_metadata_builder, AscendSFAMetadataBuilder)
@@ -648,6 +651,11 @@ def build_attn_metadata(
                     attn_metadata[layer_name] = metadata
     for updater, updates in gdn_graph_updates.values():
         updater.apply(updates)
+    if step_metadata_builders:
+        rows = min(num_actual_tokens, int(query_start_loc_cpu[num_actual_reqs]))
+        prepared_metadata_ids: set[int] = set()
+        for layer_names, builder in step_metadata_builders:
+            builder.prepare_step_metadata(attn_metadata, layer_names, rows, prepared_metadata_ids)
     return attn_metadata
 
 
