@@ -72,7 +72,6 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.dsa_attn_kv_plan import get_dsa_attn_kv_plan
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.dsa_v41 import AscendDSAV41MetadataBuilder, DeepseekV41CacheBackend
-from vllm_ascend.attention.gdn_attn_builder import AscendGDNAttentionMetadataBuilder
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -343,6 +342,21 @@ def initialize_kernel_block_table_buffers(
         group.kernel_block_table = expanded
 
 
+def _mamba_metadata_reuse_key(attn_group, builder, batch_global: bool, for_capture: bool):
+    if not isinstance(getattr(attn_group, "kv_cache_spec", None), MambaSpec) or not builder.supports_update_block_table:
+        return None
+    # Replay must refresh the buffers selected at capture, including when a provider supplies group-local inputs.
+    if for_capture:
+        builder._ascend_batch_global_at_capture = batch_global
+    else:
+        captured = getattr(builder, "_ascend_batch_global_at_capture", None)
+        if captured is False:
+            return None
+        if captured is True and not batch_global:
+            raise ValueError("Captured metadata reuse requires a batch-global Mamba provider")
+    return (attn_group.kv_cache_spec, type(builder)) if batch_global else None
+
+
 def build_attn_metadata(
     *,
     attn_groups: list[list[AttentionGroup]],
@@ -569,10 +583,12 @@ def build_attn_metadata(
                     metadata_variants = ([(target_names, common_attn_metadata)] if target_names else []) + [
                         (draft_names, draft_common)
                     ]
-            reuse_key = None
-            if isinstance(attn_metadata_builder, AscendGDNAttentionMetadataBuilder):
-                can_share = batch_global and common_attn_metadata.pcp_context is None
-                reuse_key = attn_metadata_builder.get_metadata_reuse_key(can_share, for_cudagraph_capture)
+            reuse_key = _mamba_metadata_reuse_key(
+                attn_group,
+                attn_metadata_builder,
+                batch_global and common_attn_metadata.pcp_context is None,
+                for_cudagraph_capture,
+            )
             template = cached_metadata.get(reuse_key) if reuse_key is not None else None
             attn_metadata_extra_kwargs = (
                 provider.get_extra_attn_kwargs(attn_metadata_builder, num_reqs)
