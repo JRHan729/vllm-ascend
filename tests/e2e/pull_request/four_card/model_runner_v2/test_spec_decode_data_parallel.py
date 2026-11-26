@@ -49,7 +49,6 @@ PROMPTS = [
 @patch.dict(
     os.environ,
     {
-        "VLLM_USE_V2_MODEL_RUNNER": "1",
         "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
         "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
         "HCCL_BUFFSIZE": "2048",
@@ -84,7 +83,6 @@ def test_deepseek_v4_dspark_spec_decoding_dp4_full_graph() -> None:
             "cudagraph_capture_sizes": [6, 12],
         },
         additional_config={
-            "enable_dsa_cp": False,
             "enable_fused_mc2": 0,
         },
     ) as vllm_model:

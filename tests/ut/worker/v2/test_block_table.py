@@ -9,7 +9,7 @@ from types import ModuleType
 
 import torch
 
-from vllm_ascend.patch.worker.patch_v2 import patch_uva
+from vllm_ascend.patch.worker import patch_uva
 from vllm_ascend.worker.v2.block_table import AscendBlockTables
 
 
@@ -43,7 +43,6 @@ def test_encoder_only_zero_cache_groups_initialize_and_compute(monkeypatch) -> N
         max_num_batched_tokens=8,
         max_num_blocks_per_group=[],
         device=torch.device("cpu"),
-        kernel_block_sizes=[],
     )
 
     slot_mappings = block_tables.compute_slot_mappings(

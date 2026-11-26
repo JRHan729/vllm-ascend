@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from contextlib import ExitStack
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -8,44 +9,8 @@ import pytest
 import torch
 
 from vllm_ascend.attention.context_parallel import dsa_cp
-from vllm_ascend.attention.context_parallel.dsa_cp import (
-    AscendDSACPImpl,
-    AscendDSAPCPImpl,
-    AscendDSAPCPMetadataBuilder,
-)
+from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSAPCPImpl, AscendDSAPCPMetadataBuilder
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPAttentionContext
-
-
-class TestAscendDSACPLayerMetadata:
-    def test_routes_by_cache_prefix(self):
-        impl = AscendDSACPImpl.__new__(AscendDSACPImpl)
-        impl.compress_ratio = 4
-        impl.swa_cache_layer = SimpleNamespace(prefix="swa_cache")
-        impl.compressor = SimpleNamespace(state_cache=SimpleNamespace(prefix="compressor.state_cache"))
-        impl.indexer = SimpleNamespace(
-            k_cache=SimpleNamespace(prefix="indexer.k_cache"),
-            compressor=SimpleNamespace(state_cache=SimpleNamespace(prefix="indexer.compressor.state_cache")),
-        )
-        attention_metadata = object()
-        compressor_state_metadata = object()
-        indexer_cache_metadata = object()
-        indexer_state_metadata = object()
-        swa_metadata = object()
-
-        metadata: Any = {
-            "layer": attention_metadata,
-            "compressor.state_cache": compressor_state_metadata,
-            "indexer.k_cache": indexer_cache_metadata,
-            "indexer.compressor.state_cache": indexer_state_metadata,
-            "swa_cache": swa_metadata,
-        }
-        layer_metadata = impl._get_layer_metadata("layer", metadata)
-
-        assert layer_metadata.swa is swa_metadata
-        assert layer_metadata.compressor_cache is attention_metadata
-        assert layer_metadata.compressor_state is compressor_state_metadata
-        assert layer_metadata.indexer_cache is indexer_cache_metadata
-        assert layer_metadata.indexer_state is indexer_state_metadata
 
 
 class TestAscendDSAPCPMetadataBuilderWithoutContext:
@@ -164,73 +129,132 @@ class TestAscendDSAPCPGraphPadding:
         assert scatter.call_args.args[2] is slot_mapping
 
 
-@pytest.mark.parametrize("fail_at", [None, "project", "copy"])
-def test_o_projection_keeps_weight_lifetime_in_caller(monkeypatch, fail_at):
-    events = []
-    metadata = SimpleNamespace(attn_state=dsa_cp.AscendAttentionState.PrefillNoCache)
-    tensor = torch.ones(2, 4)
+@pytest.mark.parametrize("overlap_enabled", [False, True])
+def test_pcp_query_overlap_honors_config(overlap_enabled):
+    def init_base(impl):
+        impl.multistream_dsv4_dsa_overlap = overlap_enabled
+        impl.n_local_heads = 1
+        impl.head_dim = 1
+        impl.n_local_groups = 1
+        impl.wo_a = MagicMock()
+        impl.wo_b = MagicMock()
+        impl.vllm_config = MagicMock()
 
-    def project(value, *, full_gather_wo_a_enabled):
-        assert full_gather_wo_a_enabled
-        events.append("project")
-        if fail_at == "project":
-            raise RuntimeError("projection failed")
-        return value
+    with (
+        patch.object(dsa_cp.dsa_v1.AscendDSAImpl, "__init__", init_base),
+        patch.object(dsa_cp, "enable_pcp_o_proj_weight_sharding", return_value=False),
+        patch.object(dsa_cp, "ParallelOProjection"),
+        patch.object(dsa_cp, "WeightSwitchConfig"),
+        patch.object(dsa_cp, "get_pcp_group"),
+        patch.object(dsa_cp, "get_tp_group"),
+    ):
+        impl = AscendDSAPCPImpl()
 
-    class Output:
-        def __setitem__(self, index, value):
-            events.append("copy")
-            if fail_at == "copy":
-                raise RuntimeError("copy failed")
-
-    impl = SimpleNamespace(
-        tp_size=2,
-        enable_dsa_cp_full_o_proj=True,
-        _get_layer_metadata=lambda *args: SimpleNamespace(compressor_cache=metadata),
-        _forward=lambda *args: tensor,
-        _restore_tp_head_layout=lambda *args, **kwargs: tensor,
-        _switch_o_proj_to_full_weight=lambda: events.append("full"),
-        _switch_o_proj_to_local_weight=lambda: events.append("local"),
-        _forward_o_proj=project,
-    )
-    monkeypatch.setattr(dsa_cp, "wait_for_kv_layer_from_connector", lambda *args: None)
-    monkeypatch.setattr(dsa_cp, "maybe_save_kv_layer_to_connector", lambda *args: events.append("save"))
-    output = Output()
-    if fail_at:
-        with pytest.raises(RuntimeError, match="failed"):
-            AscendDSACPImpl.forward(impl, "layer", tensor, (), {}, output)
-        assert events[-1] == "local"
-        assert "save" not in events
-    else:
-        assert AscendDSACPImpl.forward(impl, "layer", tensor, (), {}, output) is output
-        assert events == ["full", "project", "copy", "local", "save"]
+    assert impl.pcp_q_projection_overlap is overlap_enabled
+    # PCP has already prepared caches before local attention, so the base
+    # attention path must not enable a second cache-update overlap.
+    assert impl.multistream_dsv4_dsa_overlap is False
 
 
-@pytest.mark.parametrize("full", [False, True])
-@pytest.mark.parametrize("fp8_attention", [False, True])
-@pytest.mark.parametrize("with_output", [False, True])
-def test_o_projection_common_computation_uses_active_weight_layout(monkeypatch, full, fp8_attention, with_output):
-    def batch_matmul(value, weight, **kwargs):
-        return torch.bmm(value.transpose(0, 1), weight).transpose(0, 1)
+@pytest.fixture
+def cache_query_case():
+    impl = AscendDSAPCPImpl.__new__(AscendDSAPCPImpl)
+    impl.pcp_q_projection_overlap = True
+    impl.compress_ratio = 4
+    metadata = MagicMock(spec=dsa_cp.AscendDSAPCPMetadata)
+    metadata.pcp_has_global_prefill = True
+    metadata.global_dsa_metadata = object()
+    common = SimpleNamespace(num_actual_tokens=2)
+    layer_metadata = SimpleNamespace(attention=common, swa=common)
+    global_layer_metadata = SimpleNamespace(swa=object(), compressor=object(), indexer=object())
+    operations = MagicMock()
+    prepared_query = (object(), object(), object())
+    operations.query.return_value = prepared_query
+    current_stream = MagicMock()
+    query_stream = MagicMock()
+    operations.attach_mock(query_stream.wait_stream, "query_wait")
+    operations.attach_mock(current_stream.wait_stream, "current_wait")
+    impl._mla_prolog_single_stream = operations.query
+    impl._gather_and_restore_hidden_states = operations.gather
+    impl._get_layer_metadata = MagicMock(return_value=global_layer_metadata)
+    impl._update_global_swa_cache = operations.swa
+    impl._update_global_compressor_cache = operations.compressor
+    impl._update_global_indexer_cache = operations.indexer
+    impl._parallel_o_proj = SimpleNamespace(all_gather_weights=operations.weights)
+    hidden_states = MagicMock()
+    caches = tuple(object() for _ in range(6))
+    with ExitStack() as stack:
+        get_current_stream = stack.enter_context(
+            patch.object(dsa_cp.torch.npu, "current_stream", return_value=current_stream)
+        )
+        stream_context = stack.enter_context(patch.object(dsa_cp.torch.npu, "stream"))
+        get_query_stream = stack.enter_context(
+            patch.object(dsa_cp.dsa_v1, "dsv4_dsa_overlap_stream", return_value=query_stream)
+        )
+        stack.enter_context(patch.object(dsa_cp.dsa_v1, "_require_req_metadata", return_value=MagicMock()))
+        stack.enter_context(patch.object(dsa_cp.DeviceOperator, "unpack_dsa_forward_kv_cache", return_value=caches))
+        yield SimpleNamespace(
+            impl=impl,
+            metadata=metadata,
+            common=common,
+            operations=operations,
+            prepared_query=prepared_query,
+            current_stream=current_stream,
+            query_stream=query_stream,
+            get_current_stream=get_current_stream,
+            get_query_stream=get_query_stream,
+            stream_context=stream_context,
+            args=("layer", hidden_states, caches, {"layer": metadata}, layer_metadata),
+        )
 
-    monkeypatch.setattr(dsa_cp.torch_npu, "npu_transpose_batchmatmul", batch_matmul, raising=False)
-    monkeypatch.setattr(dsa_cp, "_has_weight_scale", lambda layer: True)
-    method = object.__new__(dsa_cp.AscendUnquantizedLinearMethod)
-    groups = 2 if full else 1
-    value = torch.arange(4 * groups * 3, dtype=torch.float32).reshape(4, groups * 3)
-    weight = torch.arange(groups * 3 * 2, dtype=torch.float32).reshape(groups, 3, 2)
-    wo_b = torch.arange(groups * 2 * 5, dtype=torch.float32).reshape(groups * 2, 5)
-    impl = SimpleNamespace(
-        n_group=2,
-        n_local_groups=1,
-        support_fp8_attention=fp8_attention,
-        wo_a=SimpleNamespace(quant_method=method),
-        _get_batched_wo_a_weight=lambda count: weight,
-        _apply_wo_b=lambda value, gathered: value @ wo_b,
-    )
-    expected = torch.einsum("tgh,ghr->tgr", value.reshape(4, groups, 3), weight).reshape(4, -1) @ wo_b
-    output = torch.empty_like(expected) if with_output else None
-    actual = AscendDSACPImpl._forward_o_proj(impl, value, output, full_gather_wo_a_enabled=full)
-    if with_output:
-        assert actual is output
-    torch.testing.assert_close(actual, expected)
+
+@pytest.mark.parametrize("global_prefill,local_tokens", [(True, 2), (True, 0), (False, 2)])
+@pytest.mark.parametrize("compress_ratio", [1, 4, 128])
+@pytest.mark.parametrize("overlap_enabled", [False, True])
+def test_cache_query_preparation_preserves_collectives(
+    cache_query_case, global_prefill, local_tokens, compress_ratio, overlap_enabled
+):
+    case = cache_query_case
+    case.metadata.pcp_has_global_prefill = global_prefill
+    case.common.num_actual_tokens = local_tokens
+    case.impl.compress_ratio = compress_ratio
+    case.impl.pcp_q_projection_overlap = overlap_enabled
+    overlap = overlap_enabled and global_prefill and local_tokens > 0
+    expected = ["gather", "swa"]
+    if compress_ratio > 1:
+        expected.append("compressor")
+    if compress_ratio == 4:
+        expected.append("indexer")
+    expected.append("weights")
+    if overlap:
+        expected = ["query_wait", "query"] + expected + ["current_wait"]
+    for _ in range(2):
+        case.operations.reset_mock()
+        result = case.impl._prepare_caches_and_query(*case.args)
+        assert result == (True, case.prepared_query if overlap else None)
+        assert [call[0] for call in case.operations.mock_calls] == expected
+        if overlap:
+            case.query_stream.wait_stream.assert_called_once_with(case.current_stream)
+            case.current_stream.wait_stream.assert_called_once_with(case.query_stream)
+            assert case.operations.query.call_args.kwargs == {"write_swa_cache": False}
+        else:
+            case.get_current_stream.assert_not_called()
+            case.get_query_stream.assert_not_called()
+            case.stream_context.assert_not_called()
+
+
+@pytest.mark.parametrize("failure_stage", ["query_wait", "query", "gather", "swa", "compressor", "indexer", "weights"])
+def test_cache_query_preparation_joins_stream_on_failure(cache_query_case, failure_stage):
+    case = cache_query_case
+    getattr(case.operations, failure_stage).side_effect = RuntimeError("injected failure")
+    with pytest.raises(RuntimeError, match="injected failure"):
+        case.impl._prepare_caches_and_query(*case.args)
+    case.current_stream.wait_stream.assert_called_once_with(case.query_stream)
+    assert case.operations.mock_calls[-1][0] == "current_wait"
+
+
+def test_cache_query_preparation_delegates_ordinary_metadata(cache_query_case):
+    case = cache_query_case
+    args = (*case.args[:3], {"layer": object()}, case.args[4])
+    assert case.impl._prepare_caches_and_query(*args) == (False, None)
+    assert not case.operations.mock_calls

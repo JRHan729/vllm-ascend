@@ -40,7 +40,6 @@ MTP_NUM_SPECULATIVE_TOKENS = 3
 DSPARK_NUM_SPECULATIVE_TOKENS = 5
 
 COMMON_ENV = {
-    "VLLM_USE_V2_MODEL_RUNNER": "1",
     "VLLM_BATCH_INVARIANT": "1",
     "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
     "HCCL_BUFFSIZE": "2560",
@@ -88,7 +87,6 @@ def _run_test(
         speculative_config=speculative_config,
         attention_config={"indexer_kv_dtype": "int8"},
         additional_config={
-            "enable_dsa_cp": False,
             "enable_prefill_mc2": True,
             # TODO: Re-enable after PCP decode sharding lands; DSV4 results are unstable.
             "enable_pcp_o_proj_weight_sharding": False,
